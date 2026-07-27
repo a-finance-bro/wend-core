@@ -1,0 +1,33 @@
+{
+  "name": "wend-core",
+  "version": "0.1.0",
+  "description": "The provenance-first personal graph engine behind Wend — the relationship memory layer for AI agents. People, organizations, and events with a source on every fact, human-confirmed AI writes, and an MCP server so any agent can plug in.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "src/index.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/a-finance-bro/wend-core.git"
+  },
+  "homepage": "https://www.trywend.io",
+  "keywords": [
+    "mcp",
+    "memory",
+    "relationship-memory",
+    "personal-crm",
+    "knowledge-graph",
+    "provenance",
+    "ai-agents"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "serve:example": "npx tsx examples/serve.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
