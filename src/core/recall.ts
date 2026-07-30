@@ -50,6 +50,17 @@ export const DEFAULT_TOP_K = 8;
  */
 export async function recallNodes(
   supabase: SupabaseClient,
+  /**
+   * Whose graph to search. REQUIRED, and second so it cannot be forgotten.
+   *
+   * This function runs with a user-scoped client from the web app AND with the
+   * SERVICE-ROLE client from the MCP route, where RLS does not apply. It used to
+   * take no user id and lean entirely on RLS, so the MCP path ran unscoped and a
+   * recall on one account returned a node id outside the intended scope. Making this
+   * a required positional means omitting it is a compile error rather than a
+   * a query that runs without a tenant.
+   */
+  userId: string,
   query: string,
   topK: number = DEFAULT_TOP_K,
 ): Promise<RecallResult> {
@@ -68,13 +79,20 @@ export async function recallNodes(
     // or transiently failed. Degrade to text matching so the agent can
     // still ground answers in real nodes instead of claiming the graph
     // is empty.
-    const matches = await textFallbackRecall(supabase, trimmed, k);
+    const matches = await textFallbackRecall(supabase, userId, trimmed, k);
     return { ok: true, matches, degraded: true };
   }
 
   const { data, error } = await supabase.rpc("recall_nodes", {
     query_embedding: vec,
     match_count: k,
+    // recall_nodes is SECURITY DEFINER and scoped by auth.uid(), which is NULL
+    // for the service-role client the MCP route uses. Without this parameter
+    // (migration 125) semantic recall returned zero rows for EVERY MCP request
+    // and silently fell through to text matching. It read as the Voyage rate
+    // limit. It was not. The function ignores p_user_id whenever auth.uid() is
+    // present, so an authenticated caller cannot use it to widen its scope.
+    p_user_id: userId,
   });
 
   if (error) {
@@ -103,7 +121,7 @@ export async function recallNodes(
   // the embedding-free name/text match so real name hits still surface.
   const best = matches[0]?.similarity ?? 0;
   if (matches.length === 0 || best < WEAK_SIMILARITY) {
-    const textHits = await textFallbackRecall(supabase, trimmed, k);
+    const textHits = await textFallbackRecall(supabase, userId, trimmed, k);
     const seen = new Set(matches.map((m) => m.id));
     const merged = [...matches];
     for (const t of textHits) {
@@ -136,6 +154,7 @@ const WEAK_SIMILARITY = 0.35;
  */
 async function textFallbackRecall(
   supabase: SupabaseClient,
+  userId: string,
   query: string,
   k: number,
 ): Promise<RecallMatch[]> {
@@ -153,12 +172,17 @@ async function textFallbackRecall(
   // query can't widen the match, and commas/parens (or-syntax chars).
   const pattern = (w: string) =>
     `display_name.ilike.%${w.replace(/[\\%_,()]/g, "")}%`;
-  const { data, error } = await supabase
+  let q = supabase
     .from("nodes")
     .select("id, display_name, node_types(name)")
     .is("deleted_at", null)
     .or(words.map(pattern).join(","))
     .limit(k);
+  // The leak was here. With the service-role client there is no RLS, so this
+  // query matched every user's nodes. Filter explicitly and never depend on the
+  // caller having handed us a scoped client.
+  q = q.eq("user_id", userId);
+  const { data, error } = await q;
   if (error || !data) return [];
 
   return (data as unknown as Array<{
