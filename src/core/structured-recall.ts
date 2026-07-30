@@ -42,7 +42,10 @@ export interface StructuredHit {
  * with" is not eaten by "works".
  */
 const RELATION_PHRASES: Array<{ phrases: string[]; types: string[] }> = [
-  { phrases: ["co-founder", "cofounder", "co founder"], types: ["co_founder", "founder"] },
+  // co_founder is person-to-person; `founder` is person-to-ORGANIZATION.
+  // Including both made "my cofounder" return FiveSight and Equibinder, the
+  // companies the user founded, ranked alongside the actual cofounder.
+  { phrases: ["co-founder", "cofounder", "co founder"], types: ["co_founder"] },
   { phrases: ["founded", "founder of", "started"], types: ["founder"] },
   { phrases: ["works at", "work at", "working at", "employed at", "employee of", "works for", "job at"], types: ["employee"] },
   { phrases: ["studied at", "studies at", "went to school", "attends", "student at", "alum of", "alumni of"], types: ["student", "attended"] },
@@ -63,6 +66,19 @@ const SELF_REFERENCE = /\b(my|our|mine|i|me|myself)\b/i;
 /** The user is asking for PEOPLE, so an organization is not the answer. */
 const PERSON_SEEKING =
   /\b(who|people|person|someone|anyone|folks|contacts|everyone|employees|staff|team)\b/i;
+
+/**
+ * Relations that hold between two PEOPLE. When one of these is asked for, an
+ * organization on the other end of the edge is a data error, not an answer.
+ */
+const PERSON_RELATIONS = new Set([
+  "co_founder",
+  "colleague",
+  "friend",
+  "parent",
+  "relative",
+  "knows",
+]);
 
 function matchedRelations(query: string): string[] {
   const q = query.toLowerCase();
@@ -138,6 +154,10 @@ export async function structuredRecall(
         if (!type || !relations.includes(type)) continue;
         // Return whichever end is not the user.
         const other = row.source_node?.id === selfId ? row.target_node : row.source_node;
+        // A person-to-person relation cannot be satisfied by an organization.
+        if (PERSON_RELATIONS.has(type) && (other?.node_types?.name ?? "") !== "Person") {
+          continue;
+        }
         push(other, `directly linked to you: ${type.replace(/_/g, " ")}`);
       }
     }
@@ -223,12 +243,28 @@ export async function structuredRecall(
         // caller silently sees zero rows. That is exactly how this lookup
         // appeared to "work" while finding nothing. Migration 127 unwraps the
         // scalar with #>> and indexes it with trigram.
-        const { data } = await supabase.rpc("search_person_attributes", {
+        // Exact first, then substring. `company ILIKE '%Acme%'` also matches
+        // Metabase and Metagenomi, and on prod those outranked the person who
+        // actually works at Acme.
+        const exact = await supabase.rpc("search_person_attributes", {
           p_keys: [...keys],
           p_value: name,
           p_user_id: userId,
           p_limit: limit,
+          p_exact: true,
         });
+        const data =
+          (exact.data ?? []).length > 0
+            ? exact.data
+            : (
+                await supabase.rpc("search_person_attributes", {
+                  p_keys: [...keys],
+                  p_value: name,
+                  p_user_id: userId,
+                  p_limit: limit,
+                  p_exact: false,
+                })
+              ).data;
         for (const row of (data ?? []) as Array<{
           id: string;
           display_name: string;
