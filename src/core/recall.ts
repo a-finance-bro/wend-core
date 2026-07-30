@@ -1,17 +1,27 @@
 /**
- * Vector recall over the user's graph — Subsystem #5.
+ * Recall over the user's graph — Subsystem #5.
  *
- * Embed a natural-language query via Voyage, then surface the top-N
- * nodes by cosine similarity via the `recall_nodes` RPC (migration
- * 010). Used by the chat agent's `recallNodes` tool to answer
- * questions like "who do I know in fintech?" or "what did Sarah and
- * I talk about?".
+ * Three strategies, chosen per call (see `RecallMode`):
+ *   - semantic: embed the query, rank by cosine similarity via the
+ *     `recall_nodes` RPC (migration 010, user-scoped in 125)
+ *   - keyword:  match the query's words against node names AND detail
+ *     values, no embedding call
+ *   - hybrid:   the default. Semantic first, supplemented with keyword hits
+ *     when the top semantic score is weak or the pass came back empty
  *
- * Production safety: when no Voyage key is configured — or Voyage
- * rate-limits (the free tier is 3 RPM; prod hit 429s that made the
- * agent claim it knew nothing about people it had rows for) — recall
- * degrades to a case-insensitive text match over node names + aliases
- * instead of returning nothing.
+ * Hybrid is the default because the two fail in opposite directions. Meaning
+ * finds "investors"; exact text finds "Kalinda Panholzer". A proper name embeds
+ * poorly against topical vectors, which is why a plain recall for "Professor
+ * Kumar" used to return nothing for a person plainly in the graph and the agent
+ * would report it had never heard of them.
+ *
+ * Keyword is a first-class mode rather than only a fallback, because this graph
+ * is highly structured: an exact company name, email address, LinkedIn URL or tag
+ * is better matched as text than by cosine distance, and costs no embedding call.
+ *
+ * Every result reports the mode that actually produced it. A similarity of 0
+ * means "text hit", not "weak hit", and a caller unable to tell the two apart
+ * will either discard good matches or present a name match as a semantic one.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -25,6 +35,9 @@ export interface RecallMatch {
   similarity: number;
 }
 
+/** Retrieval strategy. See recallNodes for why keyword is first-class. */
+export type RecallMode = "hybrid" | "semantic" | "keyword";
+
 export interface RecallResult {
   ok: boolean;
   matches: RecallMatch[];
@@ -32,6 +45,12 @@ export interface RecallResult {
   /** True when semantic search was unavailable (no key / rate limit)
    * and the matches came from plain text matching instead. */
   degraded?: boolean;
+  /**
+   * Which strategy actually produced these matches. Reported because "hybrid"
+   * asked for and "keyword" delivered is a materially different answer, and a
+   * caller that cannot tell will present a name-match as a semantic one.
+   */
+  mode?: RecallMode;
 }
 
 /**
@@ -63,6 +82,18 @@ export async function recallNodes(
   userId: string,
   query: string,
   topK: number = DEFAULT_TOP_K,
+  /**
+   * How to search. Default "hybrid" runs the vector pass and supplements it
+   * with keyword hits, which is what you want for almost every real question:
+   * meaning finds "investors", exact text finds "Kalinda Panholzer", and the two
+   * fail in different directions.
+   *
+   * "keyword" is a first-class choice, not just the fallback, because this graph
+   * is highly structured. An exact company name, an email address, a LinkedIn
+   * URL or a tag is better served by matching text than by cosine distance, and
+   * it needs no embedding call, so it is also the fast and free path.
+   */
+  mode: RecallMode = "hybrid",
 ): Promise<RecallResult> {
   const trimmed = query.trim();
   if (trimmed.length === 0) {
@@ -73,14 +104,23 @@ export async function recallNodes(
   // blow up the context window.
   const k = Math.min(Math.max(1, Math.floor(topK)), 32);
 
+  if (mode === "keyword") {
+    const matches = await keywordRecall(supabase, userId, trimmed, k);
+    return { ok: true, matches, mode: "keyword" };
+  }
+
   const vec = await embedText(trimmed);
   if (!vec) {
-    // Voyage no-op'd (no key), rate-limited (429 — free tier is 3 RPM),
-    // or transiently failed. Degrade to text matching so the agent can
-    // still ground answers in real nodes instead of claiming the graph
-    // is empty.
-    const matches = await textFallbackRecall(supabase, userId, trimmed, k);
-    return { ok: true, matches, degraded: true };
+    // No vector: the provider is unconfigured, rate-limited, or had a bad
+    // moment. Fall back to keyword so the agent grounds its answer in real
+    // nodes instead of concluding the graph is empty, and SAY it degraded so a
+    // caller can tell the difference between "nothing matched" and "the
+    // semantic half did not run".
+    const matches = await keywordRecall(supabase, userId, trimmed, k);
+    if (mode === "semantic") {
+      return { ok: true, matches, degraded: true, mode: "keyword" };
+    }
+    return { ok: true, matches, degraded: true, mode: "keyword" };
   }
 
   const { data, error } = await supabase.rpc("recall_nodes", {
@@ -89,8 +129,8 @@ export async function recallNodes(
     // recall_nodes is SECURITY DEFINER and scoped by auth.uid(), which is NULL
     // for the service-role client the MCP route uses. Without this parameter
     // (migration 125) semantic recall returned zero rows for EVERY MCP request
-    // and silently fell through to text matching. It read as the Voyage rate
-    // limit. It was not. The function ignores p_user_id whenever auth.uid() is
+    // and silently fell through to text matching. It read as the embedding
+    // provider's rate limit. It was not. The function ignores p_user_id whenever auth.uid() is
     // present, so an authenticated caller cannot use it to widen its scope.
     p_user_id: userId,
   });
@@ -112,16 +152,23 @@ export async function recallNodes(
   }));
 
   // Semantic search only sees nodes that HAVE an embedding. A node whose
-  // embedding was never generated (Voyage rate-limited at ingest, or a
-  // brand-new node) is invisible here even though Voyage answered THIS query
-  // fine — so a plain "recallNodes('Professor Kumar')" returned [] for a person
+  // embedding was never generated (rate-limited at ingest, or a
+  // brand-new node) is invisible here even though the provider answered THIS
+  // query fine, so a plain "recallNodes('Professor Kumar')" returned [] for a person
   // who was clearly in the graph, and the agent wrongly said "you don't have
   // anything about them". When the semantic pass comes back empty OR only weakly
   // (a proper-name query embeds poorly against topical vectors), supplement with
   // the embedding-free name/text match so real name hits still surface.
+  // `semantic` means semantic only: the caller explicitly does not want text
+  // hits mixed in, e.g. when measuring embedding quality or when the query is
+  // conceptual and a stray name match would be noise.
+  if (mode === "semantic") {
+    return { ok: true, matches, mode: "semantic" };
+  }
+
   const best = matches[0]?.similarity ?? 0;
   if (matches.length === 0 || best < WEAK_SIMILARITY) {
-    const textHits = await textFallbackRecall(supabase, userId, trimmed, k);
+    const textHits = await keywordRecall(supabase, userId, trimmed, k);
     const seen = new Set(matches.map((m) => m.id));
     const merged = [...matches];
     for (const t of textHits) {
@@ -131,11 +178,16 @@ export async function recallNodes(
       if (merged.length >= k) break;
     }
     if (merged.length > matches.length) {
-      return { ok: true, matches: merged, degraded: matches.length === 0 };
+      return {
+        ok: true,
+        matches: merged,
+        degraded: matches.length === 0,
+        mode: "hybrid",
+      };
     }
   }
 
-  return { ok: true, matches };
+  return { ok: true, matches, mode: "hybrid" };
 }
 
 /**
@@ -152,7 +204,7 @@ const WEAK_SIMILARITY = 0.35;
  * so callers can tell they're text hits, and results are deduped
  * across words in query-word order.
  */
-async function textFallbackRecall(
+async function keywordRecall(
   supabase: SupabaseClient,
   userId: string,
   query: string,
@@ -163,39 +215,91 @@ async function textFallbackRecall(
       query
         .split(/[^\p{L}\p{N}'-]+/u)
         .map((w) => w.trim())
-        .filter((w) => w.length >= 3),
+        .filter((w) => w.length >= 3 && !STOPWORDS.has(w.toLowerCase())),
     ),
   ).slice(0, 6);
   if (words.length === 0) return [];
 
-  // PostgREST `or` with ilike per word. Escape %/_ so a literal in the
-  // query can't widen the match, and commas/parens (or-syntax chars).
-  const pattern = (w: string) =>
-    `display_name.ilike.%${w.replace(/[\\%_,()]/g, "")}%`;
-  let q = supabase
-    .from("nodes")
-    .select("id, display_name, node_types(name)")
-    .is("deleted_at", null)
-    .or(words.map(pattern).join(","))
-    .limit(k);
-  // The leak was here. With the service-role client there is no RLS, so this
-  // query matched every user's nodes. Filter explicitly and never depend on the
-  // caller having handed us a scoped client.
-  q = q.eq("user_id", userId);
-  const { data, error } = await q;
-  if (error || !data) return [];
+  const safe = (w: string) => w.replace(/[\\%_,()]/g, "");
 
-  return (data as unknown as Array<{
+  // Two passes, because the interesting keywords usually are NOT in the name.
+  // "who works at Stripe" has Stripe in a `company` detail; "the professor at
+  // Stanford" has it in a link. Searching display_name only, which is what this
+  // did before, answered those with nothing and let the caller conclude the
+  // graph was empty.
+  const [byName, byDetail] = await Promise.all([
+    supabase
+      .from("nodes")
+      .select("id, display_name, node_types(name)")
+      .eq("user_id", userId)
+      .is("deleted_at", null)
+      .or(words.map((w) => `display_name.ilike.%${safe(w)}%`).join(","))
+      .limit(k),
+    supabase
+      .from("node_details")
+      .select("node_id, nodes!inner(id, display_name, deleted_at, node_types(name))")
+      .eq("user_id", userId)
+      .is("deleted_at", null)
+      .or(words.map((w) => `value.ilike.%${safe(w)}%`).join(","))
+      .limit(k * 3),
+  ]);
+
+  const out: RecallMatch[] = [];
+  const seen = new Set<string>();
+
+  for (const r of (byName.data ?? []) as unknown as Array<{
     id: string;
     display_name: string;
     node_types: { name: string } | null;
-  }>).map((r) => ({
-    id: r.id,
-    display_name: r.display_name,
-    node_type_name: r.node_types?.name ?? "Node",
-    similarity: 0,
-  }));
+  }>) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
+    // Name hits rank above detail hits: a query naming a person almost always
+    // means that person, not everyone whose bio mentions them.
+    out.push({
+      id: r.id,
+      display_name: r.display_name,
+      node_type_name: r.node_types?.name ?? "Node",
+      similarity: 0,
+    });
+  }
+
+  for (const r of (byDetail.data ?? []) as unknown as Array<{
+    node_id: string;
+    nodes: {
+      id: string;
+      display_name: string;
+      deleted_at: string | null;
+      node_types: { name: string } | null;
+    } | null;
+  }>) {
+    const n = r.nodes;
+    if (!n || n.deleted_at || seen.has(n.id)) continue;
+    seen.add(n.id);
+    out.push({
+      id: n.id,
+      display_name: n.display_name,
+      node_type_name: n.node_types?.name ?? "Node",
+      similarity: 0,
+    });
+  }
+
+  return out.slice(0, k);
 }
+
+/**
+ * Words that carry no retrieval signal but are long enough to pass the
+ * three-character filter, so they used to match half the graph. "who do I know
+ * at Stripe" should search Stripe, not "know".
+ */
+const STOPWORDS = new Set([
+  "the", "and", "who", "what", "where", "when", "which", "know", "knows",
+  "any", "all", "for", "from", "with", "about", "that", "this", "they",
+  "them", "was", "were", "are", "has", "have", "had", "can", "could",
+  "would", "should", "did", "does", "someone", "anyone", "people", "person",
+  "tell", "show", "find", "give", "list", "there",
+]);
+
 
 /**
  * Pull a node + every detail + every outgoing/incoming link in one

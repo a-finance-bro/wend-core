@@ -2,7 +2,7 @@
  * Pluggable embedding provider.
  *
  * The engine never hardcodes a model vendor: recall needs SOME 1024-dim text
- * embedding (the hosted product uses Voyage voyage-3), and self-hosters plug
+ * embedding (the hosted product uses Azure OpenAI text-embedding-3-large, requested at 1024 dimensions), and self-hosters plug
  * in whatever they run. Register a provider once at startup:
  *
  *   import { setEmbeddingProvider } from "wend-core";
