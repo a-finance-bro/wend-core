@@ -185,7 +185,19 @@ export interface NodeExpansion {
   id: string;
   display_name: string;
   node_type: string;
-  details: Array<{ name: string; value: string }>;
+  details: Array<{
+    name: string;
+    value: string;
+    /**
+     * Where this fact came from. Null only for legacy rows written before
+     * provenance was mandatory. Any agent reading this graph should be able to
+     * cite a source, because "every fact has a source, and you approved it" is
+     * the product, not a marketing line.
+     */
+    source: { label: string; type: string } | null;
+    /** True when a human approved it, as opposed to it being an AI inference. */
+    confirmed: boolean;
+  }>;
   outgoing: Array<{
     link_id: string;
     link_type: string;
@@ -228,7 +240,15 @@ export async function expandNode(
       .maybeSingle(),
     supabase
       .from("node_details")
-      .select("value, detail_definitions(name)")
+      // `sources(...)` is the whole product promise made machine-readable.
+      // Without it, an agent reading this graph over MCP gets facts with no
+      // provenance, which is the one thing Wend claims to be for. Found by
+      // asking Claude, through the live connector, "what is the source behind
+      // each fact": it called search twice looking for a capability that could
+      // tell it, and there was none.
+      .select(
+        "value, user_confirmed, detail_definitions(name), sources(source_type, display_label)",
+      )
       .eq("user_id", userId)
       .eq("node_id", nodeId)
       .is("deleted_at", null),
@@ -255,11 +275,21 @@ export async function expandNode(
 
   const details = ((detailsRes.data ?? []) as unknown as Array<{
     value: unknown;
+    user_confirmed: boolean | null;
     detail_definitions: { name: string } | null;
+    sources: { source_type: string; display_label: string } | null;
   }>)
     .map((d) => ({
       name: d.detail_definitions?.name ?? "",
       value: typeof d.value === "string" ? d.value : JSON.stringify(d.value),
+      // Kept deliberately terse. A hub node can carry dozens of details and
+      // every field here is re-sent on each agent turn, so this is the label a
+      // human would recognise plus the machine type, and nothing else. The
+      // full source row stays one lookup away in the app.
+      source: d.sources
+        ? { label: d.sources.display_label, type: d.sources.source_type }
+        : null,
+      confirmed: d.user_confirmed === true,
     }))
     .filter((d) => d.name.length > 0 && d.value.length > 0);
 
