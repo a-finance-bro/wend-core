@@ -51,6 +51,10 @@ function sourceLabel(title?: string | null): string {
   // conversations with the "Capture · " prefix; "web capture" is its legacy
   // no-title fallback.
   if (t.startsWith("capture ·") || t.startsWith("web capture")) return "Extension";
+  // Migrations from another tool ("Import from Dex") get one column of their
+  // own. Checked before the per-integration titles so an import from Google
+  // Contacts reads as a migration, not as the live Contacts sync.
+  if (t.startsWith("import from")) return "Other tools";
   if (t.includes("gmail")) return "Inbox";
   if (t.includes("calendar")) return "Calendar";
   if (t.includes("contact")) return "Google Contacts";

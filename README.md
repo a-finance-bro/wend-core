@@ -106,12 +106,14 @@ are reference implementations. We would rather say that than imply more.
 
 Drift is checked mechanically, not by memory. The hosted repo runs a verifier
 that re-derives this export from app source and fails on any mismatch, so the
-files in the first table cannot silently diverge from production:
+files in the first table cannot silently diverge from production. It has already
+caught one real drift: a change to the review-queue builder in the app left this
+repo stale, and the verifier failed rather than letting the claim rot.
 
 ```
 node scripts/verify-wend-core-parity.mjs --sha
 # wend-core parity OK: 24 engine files identical to app source.
-# engine digest: sha256:...
+# engine digest: sha256:6397880d2c88ff99635bdeaac64b8da44ceab155b0dd03956f5c69e9d56d4617
 ```
 
 ## Honest v0 notes
