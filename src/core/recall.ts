@@ -27,8 +27,14 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { embedText } from "../embed/provider.js";
+import { structuredRecall, type StructuredHit } from "./structured-recall.js";
 
 export interface RecallMatch {
+  /**
+   * Set only on structural hits: the edge that produced this match, in plain
+   * words ("directly linked to you: co founder"). Absent for similarity hits.
+   */
+  reason?: string;
   id: string;
   display_name: string;
   node_type_name: string;
@@ -45,6 +51,8 @@ export interface RecallResult {
   /** True when semantic search was unavailable (no key / rate limit)
    * and the matches came from plain text matching instead. */
   degraded?: boolean;
+  /** How many of the matches came from an exact graph edge rather than a score. */
+  structural?: number;
   /**
    * Which strategy actually produced these matches. Reported because "hybrid"
    * asked for and "keyword" delivered is a materially different answer, and a
@@ -104,9 +112,24 @@ export async function recallNodes(
   // blow up the context window.
   const k = Math.min(Math.max(1, Math.floor(topK)), 32);
 
+  // Structure first, always (except in explicit `semantic` mode, which exists
+  // to measure the embeddings in isolation). When the question is relational
+  // the graph already holds an exact answer, and an exact answer should never
+  // lose to a similarity score. See structured-recall.ts for the evaluation
+  // that motivated this.
+  const structural =
+    mode === "semantic"
+      ? []
+      : await structuredRecall(supabase, userId, trimmed, k);
+
   if (mode === "keyword") {
     const matches = await keywordRecall(supabase, userId, trimmed, k);
-    return { ok: true, matches, mode: "keyword" };
+    return {
+      ok: true,
+      matches: mergeStructural(structural, matches, k),
+      mode: "keyword",
+      ...(structural.length > 0 ? { structural: structural.length } : {}),
+    };
   }
 
   const vec = await embedText(trimmed);
@@ -117,10 +140,13 @@ export async function recallNodes(
     // caller can tell the difference between "nothing matched" and "the
     // semantic half did not run".
     const matches = await keywordRecall(supabase, userId, trimmed, k);
-    if (mode === "semantic") {
-      return { ok: true, matches, degraded: true, mode: "keyword" };
-    }
-    return { ok: true, matches, degraded: true, mode: "keyword" };
+    return {
+      ok: true,
+      matches: mergeStructural(structural, matches, k),
+      degraded: true,
+      mode: "keyword",
+      ...(structural.length > 0 ? { structural: structural.length } : {}),
+    };
   }
 
   const { data, error } = await supabase.rpc("recall_nodes", {
@@ -180,14 +206,51 @@ export async function recallNodes(
     if (merged.length > matches.length) {
       return {
         ok: true,
-        matches: merged,
+        matches: mergeStructural(structural, merged, k),
         degraded: matches.length === 0,
         mode: "hybrid",
+        ...(structural.length > 0 ? { structural: structural.length } : {}),
       };
     }
   }
 
-  return { ok: true, matches, mode: "hybrid" };
+  return {
+    ok: true,
+    matches: mergeStructural(structural, matches, k),
+    mode: "hybrid",
+    ...(structural.length > 0 ? { structural: structural.length } : {}),
+  };
+}
+
+/**
+ * Put exact graph answers above similarity guesses.
+ *
+ * A structural hit came from following a real edge, so it is not "more similar",
+ * it is CORRECT. It carries similarity 1 to say so, and its `reason` explains
+ * which edge produced it, so an agent can tell the user "she is your cofounder"
+ * rather than "she scored 0.51".
+ */
+function mergeStructural(
+  structural: StructuredHit[],
+  semantic: RecallMatch[],
+  k: number,
+): RecallMatch[] {
+  if (structural.length === 0) return semantic.slice(0, k);
+  const out: RecallMatch[] = structural.map((h) => ({
+    id: h.id,
+    display_name: h.display_name,
+    node_type_name: h.node_type_name,
+    similarity: 1,
+    reason: h.reason,
+  }));
+  const seen = new Set(out.map((m) => m.id));
+  for (const m of semantic) {
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    out.push(m);
+    if (out.length >= k) break;
+  }
+  return out.slice(0, k);
 }
 
 /**
