@@ -80,6 +80,40 @@ Confirmation is yours to build (that separation is the point): fetch
 `apply*` functions for approved rows. Or use the hosted product, which is
 this engine plus everything around it.
 
+## Is this actually the code you run?
+
+Yes for the engine, and you can check rather than take our word for it.
+
+**Byte-identical to what runs in production** (exported directly from the
+hosted app's source, no reimplementation):
+
+| Path | What it is |
+|---|---|
+| `src/core/apply.ts` | the commit path: confirmed proposals become graph rows, with dedup, alias preservation, ontology auto-mint |
+| `src/core/recall.ts` | pgvector semantic recall |
+| `src/core/path.ts` | connection paths between people |
+| `src/core/name-match.ts` | identity match-quality tiers |
+| `src/core/build-items.ts` | shapes the review queue |
+| `src/core/types.ts`, `src/core/paginate.ts` | shared types and PostgREST paging |
+| `src/crypto/secret-box.ts` | AES-256-GCM secret box for OAuth tokens |
+| `schema/*.sql` | the graph, provenance, proposal-queue and recall DDL |
+
+**Written for this repo, not lifted from production**: `src/core/dispatch.ts`,
+`src/core/tool-definitions.ts`, `src/mcp/server.ts`, and `examples/serve.ts`.
+The hosted app has its own equivalents wired into its request lifecycle. These
+are functionally faithful, and the governance invariant is identical, but they
+are reference implementations. We would rather say that than imply more.
+
+Drift is checked mechanically, not by memory. The hosted repo runs a verifier
+that re-derives this export from app source and fails on any mismatch, so the
+files in the first table cannot silently diverge from production:
+
+```
+node scripts/verify-wend-core-parity.mjs --sha
+# wend-core parity OK: 24 engine files identical to app source.
+# engine digest: sha256:...
+```
+
 ## Honest v0 notes
 
 - The schema is Postgres/Supabase-shaped: row-level security policies
