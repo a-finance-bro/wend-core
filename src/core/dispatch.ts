@@ -111,7 +111,17 @@ export async function dispatchToolCall(
       if (!query) return { ok: false, error: "query is required" };
       const limit = Number(args.limit ?? 8);
       try {
-        const hits = await recallNodes(ctx.supabase, query, Number.isFinite(limit) ? limit : 8);
+        // userId is a REQUIRED positional on recallNodes precisely so that
+        // omitting it is a compile error rather than an unscoped read: this
+        // dispatch runs with whatever client the host supplies, including a
+        // service-role one where RLS does not apply. It was previously called
+        // without it, which passed the query string in as the tenant id.
+        const hits = await recallNodes(
+          ctx.supabase,
+          ctx.userId,
+          query,
+          Number.isFinite(limit) ? limit : 8,
+        );
         return { ok: true, data: { hits } };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : "recall failed" };

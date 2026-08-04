@@ -27,6 +27,13 @@ export {
 
 // Read path.
 export { recallNodes } from "./core/recall.js";
+// Expand recall hits in the database, so an agent can answer without a
+// details round trip per match.
+export {
+  buildSummary,
+  digestForNodes,
+  type NodeDigest,
+} from "./core/recall-digest.js";
 export { findConnectionPath } from "./core/path.js";
 
 // Governed tool surface (propose-only writes) + dispatch.
