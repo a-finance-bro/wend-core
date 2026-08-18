@@ -7,9 +7,11 @@
  *   WEND_USER_ID              the user whose graph this server exposes
  *   PORT                      default 8787
  *
- * Single-user by design: this example maps one bearer token (API_TOKEN env,
- * default "dev") to one user. Multi-user hosting needs real key management —
- * see the hosted product, or wire your own table like the schema's api_keys.
+ * Single-user by design: it maps one bearer token (API_TOKEN, required) to one
+ * user. It binds loopback, sends no CORS headers, and refuses to start without
+ * a token, because it holds a service-role key and that key bypasses row-level
+ * security. Multi-user hosting needs real key management; the `api_keys` table
+ * in schema/ is a starting point.
  *
  *   npx tsx examples/serve.ts
  *   # then: claude mcp add --transport http wend http://localhost:8787 \
@@ -25,21 +27,23 @@ import { ensureMcpConversation, handleMcpMessage } from "../src/mcp/server.js";
 const url = process.env.SUPABASE_URL;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const userId = process.env.WEND_USER_ID;
-const token = process.env.API_TOKEN ?? "dev";
+const token = process.env.API_TOKEN;
 const port = Number(process.env.PORT ?? 8787);
 
+// Fail closed. This process holds a service-role key, which bypasses row-level
+// security, so it must never come up with a guessable credential or none.
 if (!url || !key || !userId) {
   console.error("Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and WEND_USER_ID.");
+  process.exit(1);
+}
+if (!token) {
+  console.error("Set API_TOKEN. This server holds a service-role key and will not start without one.");
   process.exit(1);
 }
 
 const supabase = createClient(url, key);
 
 const server = createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, DELETE");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-
   if (req.method === "OPTIONS") return void res.writeHead(204).end();
   if (req.method === "DELETE") return void res.writeHead(200).end();
   if (req.method !== "POST") {
@@ -77,6 +81,8 @@ const server = createServer(async (req, res) => {
   res.end(JSON.stringify(Array.isArray(body) ? responses : responses[0]));
 });
 
-server.listen(port, () => {
-  console.log(`wend-core MCP server listening on http://localhost:${port}`);
+// Loopback only. Binding every interface would put a service-role credential on
+// whatever network the machine happens to be on.
+server.listen(port, "127.0.0.1", () => {
+  console.log(`wend-core MCP server listening on http://127.0.0.1:${port}`);
 });

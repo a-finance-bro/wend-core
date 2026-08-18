@@ -10,7 +10,7 @@
  * Pure + deterministic so it's unit-testable and runs the same on web + mobile.
  * Conservative by design: it anchors on at least one FULLY-matching name part,
  * so "A. V." doesn't match every two-letter person, and a differing full last
- * name ("Dana Okafor" vs "Ansh Kumar") is never a match.
+ * name ("Dana Okafor" vs "Dana Mbeki") is never a match.
  */
 
 export type NameMatch = "exact" | "variant" | null;

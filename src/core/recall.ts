@@ -83,9 +83,9 @@ export async function recallNodes(
    * This function runs with a user-scoped client from the web app AND with the
    * SERVICE-ROLE client from the MCP route, where RLS does not apply. It used to
    * take no user id and lean entirely on RLS, so the MCP path ran unscoped and a
-   * recall on one account returned a node id outside the intended scope. Making this
-   * a required positional means omitting it is a compile error rather than a
-   * a query that runs without a tenant.
+   * the caller must pass the user it has already authenticated. Making this
+   * argument required means a caller that forgets the scope is a compile error
+   * rather than a query with no tenant.
    */
   userId: string,
   query: string,

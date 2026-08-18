@@ -1,25 +1,25 @@
 /**
  * Deterministic, structure-first retrieval.
  *
- * WHY THIS EXISTS. An evaluation against the founder's real real graph put
- * semantic-only recall at 5/10 rank-1 with 3 outright misses, and every failure
- * had the same shape: the question was about a RELATIONSHIP, and the answer was
- * literally an edge in the graph.
+ * WHY THIS EXISTS. On an evaluation set of real relationship questions,
+ * semantic-only recall missed badly, and every failure had the same shape: the
+ * question was about a RELATIONSHIP, and the answer was literally an edge in
+ * the graph.
  *
- *   "my cofounder" ranked Dana Okafor nowhere in the top 8, behind NewCo, Future
- *   Founders Club and four strangers. Her node says `note: Cofounder at A14
- *   Labs`, `title: Co-Founder, Growth & Ops`, `headline: Founder @ Wend`, and
- *   there is an edge `Dana Okafor -[co_founder]-> Dana Okafor`. Embeddings could not
- *   find her because ~500 imported LinkedIn contacts also say "Co-Founder & CEO"
- *   in their title. The word is everywhere; the EDGE is unique.
+ *   "my cofounder" can rank the actual cofounder outside the top ten, behind
+ *   companies and strangers. Their node says `title: Co-Founder`, and there is
+ *   an edge `Self -[co_founder]-> Person`. Embeddings cannot separate them
+ *   because in an imported contact list hundreds of people also say
+ *   "Co-Founder" in a title. The word is everywhere; the EDGE is unique.
  *
- *   "people who work at Acme" returned the Acme org node at 0.612 and no people
- *   at all, while Priya Raman sat one `employee` edge away.
+ *   "people who work at Acme" returns the Acme organization node and no people
+ *   at all, while the people sit one `employee` edge away.
  *
  * No amount of embedding tuning fixes that, because it is not a similarity
  * problem. A vector search asks "what reads like this sentence"; the user asked
  * "who is connected to me this way". This module answers the second question
  * with SQL, and recall.ts puts its results above the semantic ones, which are
+
  * still what answers genuinely fuzzy questions like "who do I know in fintech".
  *
  * Everything here is deterministic: no model call, no scoring heuristic, nothing
@@ -163,9 +163,9 @@ export async function structuredRecall(
     }
   }
 
-  // ── 2. "people who work at Acme": org named in the query, follow its edges ─
+  // ── 2. "people who work at Meta": org named in the query, follow its edges ─
   //
-  // Semantic search finds the ORG for these (Acme scored 0.612) and stops. The
+  // Semantic search finds the ORG for these (Meta scored 0.612) and stops. The
   // person the user wants is one edge away and scored nowhere, because their
   // node is mostly their own name and title.
   if (wantsPeople && out.length < limit) {
@@ -210,8 +210,8 @@ export async function structuredRecall(
 
   // ── 3. Attribute lookup: the fact is structured, just not as an edge ──────
   //
-  // "people who work at Acme" fails traversal because Priya Raman has
-  // company="Acme" as a DETAIL and no `employee` edge to a Acme org node (the
+  // "people who work at Acme" fails traversal because a person has
+  // company="Meta" as a DETAIL and no `employee` edge to a Meta org node (the
   // org-linking worker has not reached her). The fact is every bit as
   // structured as an edge: a typed key on a typed node. So match it directly.
   //
@@ -243,9 +243,9 @@ export async function structuredRecall(
         // caller silently sees zero rows. That is exactly how this lookup
         // appeared to "work" while finding nothing. Migration 127 unwraps the
         // scalar with #>> and indexes it with trigram.
-        // Exact first, then substring. `company ILIKE '%Acme%'` also matches
+        // Exact first, then substring. `company ILIKE '%Meta%'` also matches
         // Metabase and Metagenomi, and on prod those outranked the person who
-        // actually works at Acme.
+        // actually works at Meta.
         const exact = await supabase.rpc("search_person_attributes", {
           p_keys: [...keys],
           p_value: name,

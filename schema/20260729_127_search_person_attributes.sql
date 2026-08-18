@@ -1,8 +1,8 @@
 -- 127: exact attribute lookup over people, for structure-first recall.
 --
--- WHY: an evaluation on a real real graph showed "people who work at
--- Acme" returning the Acme ORG node and no people, while Priya Raman sat there
--- with company="Acme". She has no `employee` edge to a Acme node (the
+-- WHY: an evaluation on a real graph showed "people who work at
+-- Acme" returning the Acme ORG node and no people, while the people sat there
+-- with company="Meta". She has no `employee` edge to a Meta node (the
 -- org-linking worker never reached her), so graph traversal cannot find her
 -- either. The fact is perfectly structured, it is simply a typed detail rather
 -- than an edge, and a relationship product should be able to answer "who works
@@ -51,14 +51,14 @@ as $$
     and nt.name = 'Person'
     and dd.name = any(p_keys)
     -- #>> '{}' unwraps a scalar jsonb to text without the surrounding quotes,
-    -- so "Acme" matches Acme rather than needing the caller to guess at quoting.
+    -- so "Meta" matches Meta rather than needing the caller to guess at quoting.
     and (d.value #>> '{}') ilike '%' || p_value || '%'
   order by n.id, dd.name
   limit p_limit;
 $$;
 
 comment on function public.search_person_attributes(text[], text, uuid, integer) is
-  'Find people by a typed detail value (company, school, location...). Powers structure-first recall for questions like "who works at Acme", where the fact lives in a detail rather than an edge. jsonb is unwrapped with #>> so callers match plain text.';
+  'Find people by a typed detail value (company, school, location...). Powers structure-first recall for questions like "who works at Meta", where the fact lives in a detail rather than an edge. jsonb is unwrapped with #>> so callers match plain text.';
 
 create extension if not exists pg_trgm;
 

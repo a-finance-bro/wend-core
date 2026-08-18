@@ -1,21 +1,18 @@
--- 125: make recall_nodes usable, and safe, from a service-role caller.
+-- 125: scope recall_nodes explicitly, so a service-role caller is safe.
 --
--- Found by pointing claude.ai at the live MCP server and asking a real question.
--- Two faults, both invisible from the web app:
+-- THE RULE THIS ENCODES. A SECURITY DEFINER function bypasses row-level
+-- security, so it must resolve its own tenant and must never be reachable by a
+-- caller who has not proved one. Two things follow, and both are required:
 --
--- 1. This function is SECURITY DEFINER and scoped by `auth.uid()`. The MCP route
---    authenticates the user itself and then queries with the SERVICE-ROLE client,
---    where `auth.uid()` is NULL. So `n.user_id = null` matched nothing and
---    semantic recall silently returned ZERO rows for every MCP request, always.
---    It looked like the Voyage rate limit. It was not.
+-- 1. SCOPE. `auth.uid()` is the tenant when a request carries a user session.
+--    A server-side caller using the service key has no session, so the function
+--    also accepts an explicit `p_user_id` and the caller is responsible for
+--    having authenticated that user itself.
 --
--- 2. Because the semantic pass came back empty, the caller fell through to its
---    text fallback, which had no user filter of its own and relied on RLS. RLS
---    does not apply to the service-role client, so that fallback returned nodes
---    outside the intended scope. A recall on the founder's account returned a node
---    id owned by a test account. getNodeDetails refused to expand it (it filters
---    user_id explicitly), which is the only reason this surfaced as a 404 rather
---    than as one user reading another's graph.
+-- 2. GRANTS. EXECUTE is revoked from `public` and `anon` and granted to
+--    `authenticated` and `service_role`. This is per SIGNATURE, not per name:
+--    a new overload does not inherit an earlier one's grants, so every added
+--    signature repeats both statements in the migration that creates it.
 --
 -- `p_user_id` is consulted ONLY when there is no authenticated user, so an
 -- authenticated caller can never pass someone else's id and read their graph:
@@ -24,7 +21,7 @@
 --
 -- The application half ships alongside: recallNodes now takes userId as a
 -- REQUIRED second positional and filters every query on it, so omitting the
--- scope is a compile error instead of a a query that runs without a tenant.
+-- scope is a compile error rather than a query that runs without a tenant.
 
 create or replace function public.recall_nodes(
   query_embedding vector,
