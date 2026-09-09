@@ -1,7 +1,7 @@
 -- 127: exact attribute lookup over people, for structure-first recall.
 --
--- WHY: an evaluation on a real graph showed "people who work at
--- Acme" returning the Acme ORG node and no people, while the people sat there
+-- WHY: an evaluation on a real 1,282-node graph showed "people who work at
+-- Meta" returning the Meta ORG node and no people, while Ami Vasani sat there
 -- with company="Meta". She has no `employee` edge to a Meta node (the
 -- org-linking worker never reached her), so graph traversal cannot find her
 -- either. The fact is perfectly structured, it is simply a typed detail rather

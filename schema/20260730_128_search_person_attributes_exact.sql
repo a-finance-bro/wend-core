@@ -1,7 +1,7 @@
 -- 128: exact-match mode for attribute lookup.
 --
--- `company ILIKE '%Acme%'` also matches Metabase and Metagenomi. On prod those
--- outranked the person who actually works at Acme, because a structural hit
+-- `company ILIKE '%Meta%'` also matches Metabase and Metagenomi. On prod those
+-- outranked the person who actually works at Meta, because a structural hit
 -- carries similarity 1 regardless of how loose the match was. The caller now
 -- tries exact first and only widens to substring when exact finds nothing.
 
@@ -51,4 +51,4 @@ as $$
 $$;
 
 comment on function public.search_person_attributes(text[], text, uuid, integer, boolean) is
-  'Find people by a typed detail value (company, school, location...). Powers structure-first recall for questions like "who works at Acme", where the fact lives in a detail rather than an edge. p_exact does case-insensitive equality; callers should try it first, since a substring match on "Acme" also hits Metabase. jsonb is unwrapped with #>> so callers match plain text.';
+  'Find people by a typed detail value (company, school, location...). Powers structure-first recall for questions like "who works at Meta", where the fact lives in a detail rather than an edge. p_exact does case-insensitive equality; callers should try it first, since a substring match on "Meta" also hits Metabase. jsonb is unwrapped with #>> so callers match plain text.';

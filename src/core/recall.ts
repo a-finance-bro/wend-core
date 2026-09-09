@@ -27,12 +27,21 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { embedText } from "../embed/provider.js";
+import { proximityLane, rrfFuse, temporalLane, type Lane } from "./recall-lanes.js";
 import { structuredRecall, type StructuredHit } from "./structured-recall.js";
+import {
+  parseTimeExpression,
+  stripTimePhrase,
+  type TimeWindow,
+} from "./time-expressions.js";
+import { byWindowStart, factWindow, heldAt } from "./validity.js";
 
 export interface RecallMatch {
   /**
-   * Set only on structural hits: the edge that produced this match, in plain
-   * words ("directly linked to you: co founder"). Absent for similarity hits.
+   * Set on hits that came from something better than a score: a structural hit
+   * carries the edge that produced it ("directly linked to you: co founder"),
+   * a temporal-only hit carries the window ("interacted with you in March").
+   * Absent for plain similarity and text hits.
    */
   reason?: string;
   id: string;
@@ -43,6 +52,15 @@ export interface RecallMatch {
 
 /** Retrieval strategy. See recallNodes for why keyword is first-class. */
 export type RecallMode = "hybrid" | "semantic" | "keyword";
+
+/**
+ * What actually ran: the base strategy plus the deterministic lanes that
+ * contributed to THESE matches. "hybrid+temporal+proximity" means the vector
+ * and text lanes fused with an interaction-window lane and a graph-proximity
+ * boost; a bare base mode means the extra lanes had nothing to add. Reported,
+ * never requested: callers still ask for one of the three base modes.
+ */
+export type ReportedRecallMode = RecallMode | `${RecallMode}+${string}`;
 
 export interface RecallResult {
   ok: boolean;
@@ -56,9 +74,11 @@ export interface RecallResult {
   /**
    * Which strategy actually produced these matches. Reported because "hybrid"
    * asked for and "keyword" delivered is a materially different answer, and a
-   * caller that cannot tell will present a name-match as a semantic one.
+   * caller that cannot tell will present a name-match as a semantic one. Lane
+   * suffixes ("+temporal", "+proximity") appear only when that lane actually
+   * contributed to the returned matches.
    */
-  mode?: RecallMode;
+  mode?: ReportedRecallMode;
 }
 
 /**
@@ -83,9 +103,9 @@ export async function recallNodes(
    * This function runs with a user-scoped client from the web app AND with the
    * SERVICE-ROLE client from the MCP route, where RLS does not apply. It used to
    * take no user id and lean entirely on RLS, so the MCP path ran unscoped and a
-   * the caller must pass the user it has already authenticated. Making this
-   * argument required means a caller that forgets the scope is a compile error
-   * rather than a query with no tenant.
+   * recall on one account returned a node id owned by another user. Making this
+   * a required positional means omitting it is a compile error rather than a
+   * silent cross-tenant read.
    */
   userId: string,
   query: string,
@@ -112,41 +132,70 @@ export async function recallNodes(
   // blow up the context window.
   const k = Math.min(Math.max(1, Math.floor(topK)), 32);
 
-  // Structure first, always (except in explicit `semantic` mode, which exists
-  // to measure the embeddings in isolation). When the question is relational
-  // the graph already holds an exact answer, and an exact answer should never
-  // lose to a similarity score. See structured-recall.ts for the evaluation
-  // that motivated this.
-  const structural =
+  // The two deterministic lanes. `semantic` mode exists to measure the
+  // embeddings in isolation, so it takes neither. The time window, when the
+  // query carries one, also REWRITES what the content lanes search: "sarah
+  // last week" should text-match "sarah", not "week", and the phrase itself
+  // becomes the temporal lane's whole job.
+  const window = mode === "semantic" ? null : parseTimeExpression(trimmed);
+  const searchText = window ? stripTimePhrase(trimmed, window) : trimmed;
+
+  const temporalPromise: Promise<Lane> = window
+    ? temporalLane(supabase, userId, window)
+    : Promise.resolve({ name: "temporal", ids: [] });
+  const proximityPromise: Promise<Lane> =
     mode === "semantic"
+      ? Promise.resolve({ name: "proximity", ids: [] })
+      : proximityLane(supabase, userId);
+
+  // Structure first, always (except in explicit `semantic` mode). When the
+  // question is relational the graph already holds an exact answer, and an
+  // exact answer should never lose to a similarity score. See
+  // structured-recall.ts for the evaluation that motivated this.
+  const structural =
+    mode === "semantic" || searchText.length === 0
       ? []
-      : await structuredRecall(supabase, userId, trimmed, k);
+      : await structuredRecall(supabase, userId, searchText, k);
 
   if (mode === "keyword") {
-    const matches = await keywordRecall(supabase, userId, trimmed, k);
-    return {
-      ok: true,
-      matches: mergeStructural(structural, matches, k),
-      mode: "keyword",
-      ...(structural.length > 0 ? { structural: structural.length } : {}),
-    };
+    const matches =
+      searchText.length > 0
+        ? await keywordRecall(supabase, userId, searchText, k)
+        : [];
+    return fuseAndFinish(supabase, userId, {
+      base: "keyword",
+      contentMatches: [{ name: "keyword", matches }],
+      temporal: await temporalPromise,
+      proximity: await proximityPromise,
+      window,
+      structural,
+      k,
+    });
   }
 
-  const vec = await embedText(trimmed);
+  const vec = searchText.length > 0 ? await embedText(searchText) : null;
   if (!vec) {
     // No vector: the provider is unconfigured, rate-limited, or had a bad
-    // moment. Fall back to keyword so the agent grounds its answer in real
+    // moment (or the query stripped to a bare time phrase, which embeds as
+    // nothing). Fall back to keyword so the agent grounds its answer in real
     // nodes instead of concluding the graph is empty, and SAY it degraded so a
     // caller can tell the difference between "nothing matched" and "the
-    // semantic half did not run".
-    const matches = await keywordRecall(supabase, userId, trimmed, k);
-    return {
-      ok: true,
-      matches: mergeStructural(structural, matches, k),
-      degraded: true,
-      mode: "keyword",
-      ...(structural.length > 0 ? { structural: structural.length } : {}),
-    };
+    // semantic half did not run". A pure time question is not degraded: the
+    // temporal lane IS its answer.
+    const matches =
+      searchText.length > 0
+        ? await keywordRecall(supabase, userId, searchText, k)
+        : [];
+    return fuseAndFinish(supabase, userId, {
+      base: "keyword",
+      contentMatches: [{ name: "keyword", matches }],
+      temporal: await temporalPromise,
+      proximity: await proximityPromise,
+      window,
+      structural,
+      k,
+      degraded: searchText.length > 0,
+    });
   }
 
   const { data, error } = await supabase.rpc("recall_nodes", {
@@ -193,31 +242,128 @@ export async function recallNodes(
   }
 
   const best = matches[0]?.similarity ?? 0;
+  const contentMatches: Array<{ name: string; matches: RecallMatch[] }> = [
+    { name: "semantic", matches },
+  ];
+  let degraded = false;
   if (matches.length === 0 || best < WEAK_SIMILARITY) {
-    const textHits = await keywordRecall(supabase, userId, trimmed, k);
-    const seen = new Set(matches.map((m) => m.id));
-    const merged = [...matches];
-    for (const t of textHits) {
-      if (seen.has(t.id)) continue;
-      seen.add(t.id);
-      merged.push(t);
-      if (merged.length >= k) break;
-    }
-    if (merged.length > matches.length) {
-      return {
-        ok: true,
-        matches: mergeStructural(structural, merged, k),
-        degraded: matches.length === 0,
-        mode: "hybrid",
-        ...(structural.length > 0 ? { structural: structural.length } : {}),
-      };
+    const textHits = await keywordRecall(supabase, userId, searchText, k);
+    contentMatches.push({ name: "keyword", matches: textHits });
+    degraded = matches.length === 0 && textHits.length > 0;
+  }
+
+  return fuseAndFinish(supabase, userId, {
+    base: "hybrid",
+    contentMatches,
+    temporal: await temporalPromise,
+    proximity: await proximityPromise,
+    window,
+    structural,
+    k,
+    degraded,
+  });
+}
+
+/**
+ * Fuse the ranked lanes with RRF, resolve any temporal-only candidates to real
+ * nodes, put structural answers on top, and report honestly which lanes made
+ * the answer.
+ *
+ * The temporal lane is a CONTENT lane: "who did I meet in March" has no
+ * keyword and no useful vector, so the window is allowed to introduce people.
+ * Proximity is a BOOST lane only: being near a recently-contacted person makes
+ * a match rank higher, it never makes somebody a match by itself.
+ */
+async function fuseAndFinish(
+  supabase: SupabaseClient,
+  userId: string,
+  args: {
+    base: "hybrid" | "keyword";
+    contentMatches: Array<{ name: string; matches: RecallMatch[] }>;
+    temporal: Lane;
+    proximity: Lane;
+    window: TimeWindow | null;
+    structural: StructuredHit[];
+    k: number;
+    degraded?: boolean;
+  },
+): Promise<RecallResult> {
+  const { base, contentMatches, temporal, proximity, window, structural, k } = args;
+
+  const matchById = new Map<string, RecallMatch>();
+  for (const lane of contentMatches) {
+    for (const m of lane.matches) {
+      if (!matchById.has(m.id)) matchById.set(m.id, m);
     }
   }
 
+  const contentLanes: Lane[] = contentMatches.map((l) => ({
+    name: l.name,
+    ids: l.matches.map((m) => m.id),
+  }));
+  if (window) contentLanes.push(temporal);
+
+  const fused = rrfFuse(contentLanes, [proximity]);
+
+  // Temporal-only candidates arrive as bare ids; give them names, and drop
+  // anyone deleted or unresolvable. Read a little past k so a dropped row
+  // does not shorten the answer.
+  const unresolved = fused
+    .filter((c) => !matchById.has(c.id))
+    .slice(0, k + 8)
+    .map((c) => c.id);
+  if (unresolved.length > 0) {
+    try {
+      const { data } = await supabase
+        .from("nodes")
+        .select("id, display_name, node_types(name)")
+        .eq("user_id", userId)
+        .in("id", unresolved)
+        .is("deleted_at", null);
+      for (const r of (data ?? []) as unknown as Array<{
+        id: string;
+        display_name: string;
+        node_types: { name: string } | null;
+      }>) {
+        if (!r?.id || matchById.has(r.id)) continue;
+        matchById.set(r.id, {
+          id: r.id,
+          display_name: r.display_name,
+          node_type_name: r.node_types?.name ?? "Node",
+          similarity: 0,
+          ...(window ? { reason: `interaction in the window "${window.phrase}"` } : {}),
+        });
+      }
+    } catch {
+      /* a failed name lookup costs those candidates, never the recall */
+    }
+  }
+
+  const laneUse = new Map<string, string[]>();
+  const ranked: RecallMatch[] = [];
+  for (const c of fused) {
+    const m = matchById.get(c.id);
+    if (!m) continue;
+    ranked.push(m);
+    laneUse.set(c.id, c.lanes);
+    if (ranked.length >= k) break;
+  }
+
+  const finalMatches = mergeStructural(structural, ranked, k);
+
+  // The suffixes are earned, not asserted: a lane is reported only when a
+  // returned match actually carries its vote.
+  const contributed = (laneName: string) =>
+    finalMatches.some((m) => (laneUse.get(m.id) ?? []).includes(laneName));
+  let mode: ReportedRecallMode = base;
+  if (window && contributed("temporal")) mode = `${mode}+temporal` as ReportedRecallMode;
+  if (contributed("proximity")) mode = `${mode}+proximity` as ReportedRecallMode;
+
   return {
     ok: true,
-    matches: mergeStructural(structural, matches, k),
-    mode: "hybrid",
+    matches: finalMatches,
+    mode,
+    ...(args.degraded ? { degraded: true } : {}),
     ...(structural.length > 0 ? { structural: structural.length } : {}),
   };
 }
@@ -266,8 +412,12 @@ const WEAK_SIMILARITY = 0.35;
  * session client to the user). No similarity signal — entries carry 0
  * so callers can tell they're text hits, and results are deduped
  * across words in query-word order.
+ *
+ * Exported so the command palette can search the graph on its own SQL-only
+ * path: the palette must never spend an embedding call on a keystroke, so it
+ * calls this directly rather than recallNodes (which may embed in hybrid mode).
  */
-async function keywordRecall(
+export async function keywordRecall(
   supabase: SupabaseClient,
   userId: string,
   query: string,
@@ -389,6 +539,35 @@ export interface NodeExpansion {
     /** True when a human approved it, as opposed to it being an AI inference. */
     confirmed: boolean;
   }>;
+  /**
+   * Values that STOPPED being true, each with the window it held and the source
+   * behind it. Present only when the caller asks for history, because it is the
+   * answer to a question ("when did she leave Stripe") and not context every
+   * agent turn should pay for.
+   */
+  history?: Array<{
+    name: string;
+    value: string;
+    /** Start of the window. Null when the graph never learned one. */
+    from: string | null;
+    /** False when `from` is when Wend first held the fact, not a recorded start. */
+    from_known: boolean;
+    /** End of the window. Always set on a history row. */
+    until: string | null;
+    source: { label: string; type: string } | null;
+  }>;
+  /**
+   * How many values on this node have ended.
+   *
+   * Only on a read that already asked about time, because counting it otherwise
+   * costs a second query on the hottest path in the product for a number nobody
+   * asked for. What tells an agent history EXISTS is the capability description,
+   * which is where a capability belongs: patching the answer instead of the
+   * catalogue is the mistake `listCapabilities` was built to stop.
+   */
+  ended_values?: number;
+  /** Echoed when the caller read the graph at an instant other than now. */
+  as_of?: string;
   outgoing: Array<{
     link_id: string;
     link_type: string;
@@ -417,11 +596,40 @@ export interface NodeExpansion {
  *  real dedup/context question; hub nodes report the omitted remainder. */
 const EXPAND_LINK_CAP = 60;
 
+/**
+ * How to read a node's facts in time.
+ *
+ * ⚠️ CURRENT IS THE DEFAULT AND MUST STAY THE DEFAULT. Every caller that existed
+ * before validity windows asks this function for "what is true", and answering
+ * with a person's whole employment history instead would be a regression on
+ * every screen and every agent turn at once.
+ */
+export interface ExpandOptions {
+  /**
+   * Read the graph as it stood at this instant (ISO). Facts that had not
+   * started yet are left out, facts that had not ended yet are included.
+   */
+  asOf?: string | null;
+  /** Also return the values that ended, each with its window and its source. */
+  includeHistory?: boolean;
+}
+
 export async function expandNode(
   supabase: SupabaseClient,
   userId: string,
   nodeId: string,
+  options: ExpandOptions = {},
 ): Promise<NodeExpansion | null> {
+  // An unparseable as_of is NOT silently taken as now: an agent that asked for
+  // 2019 and got today would quote today's facts as history. Invalid input
+  // means the caller gets nothing back rather than a confident wrong answer.
+  const asOfMs =
+    options.asOf === undefined || options.asOf === null || options.asOf === ""
+      ? null
+      : new Date(options.asOf).getTime();
+  if (asOfMs !== null && Number.isNaN(asOfMs)) return null;
+  const at = asOfMs ?? Date.now();
+
   const [nodeRes, detailsRes, outgoingRes, incomingRes] = await Promise.all([
     supabase
       .from("nodes")
@@ -438,22 +646,27 @@ export async function expandNode(
       // each fact": it called search twice looking for a capability that could
       // tell it, and there was none.
       .select(
-        "value, user_confirmed, detail_definitions(name), sources(source_type, display_label)",
+        "value, user_confirmed, valid_from, valid_until, created_at, deleted_at, detail_definitions(name), sources(source_type, display_label)",
       )
       .eq("user_id", userId)
       .eq("node_id", nodeId)
+      // ⚠️ KEEP THIS FILTER. Both node_details indexes are PARTIAL on
+      // `deleted_at is null` (migration 004), so a read without it cannot use
+      // either one and falls to a sequential scan on the hottest query in the
+      // product. Ended values are fetched separately, through the window index
+      // migration 190 adds, and only when somebody asks for them.
       .is("deleted_at", null),
     supabase
       .from("links")
       .select(
-        "id, link_types(name), target_node:nodes!links_target_node_id_fkey(id, display_name), link_details(value, detail_definitions(name), deleted_at)",
+        "id, link_types(name), target_node:nodes!links_target_node_id_fkey(id, display_name), link_details(value, detail_definitions(name), deleted_at, valid_from, valid_until, created_at)",
       )
       .eq("user_id", userId)
       .eq("source_node_id", nodeId),
     supabase
       .from("links")
       .select(
-        "id, link_types(name), source_node:nodes!links_source_node_id_fkey(id, display_name), link_details(value, detail_definitions(name), deleted_at)",
+        "id, link_types(name), source_node:nodes!links_source_node_id_fkey(id, display_name), link_details(value, detail_definitions(name), deleted_at, valid_from, valid_until, created_at)",
       )
       .eq("user_id", userId)
       .eq("target_node_id", nodeId),
@@ -467,9 +680,18 @@ export async function expandNode(
   const details = ((detailsRes.data ?? []) as unknown as Array<{
     value: unknown;
     user_confirmed: boolean | null;
+    valid_from: string | null;
+    valid_until: string | null;
+    created_at: string | null;
+    deleted_at: string | null;
     detail_definitions: { name: string } | null;
     sources: { source_type: string; display_label: string } | null;
   }>)
+    // Current by default, and at `at` when the caller named an instant. Rows
+    // whose window has closed are already tombstoned by closeWindowPatch, so
+    // this is belt and braces on the live read; it is load-bearing for an as-of
+    // read, where a fact that had not started yet must not appear.
+    .filter((d) => heldAt(d, at))
     .map((d) => ({
       name: d.detail_definitions?.name ?? "",
       value: typeof d.value === "string" ? d.value : JSON.stringify(d.value),
@@ -488,10 +710,16 @@ export async function expandNode(
     value: unknown;
     detail_definitions: { name: string } | null;
     deleted_at: string | null;
+    valid_from: string | null;
+    valid_until: string | null;
+    created_at: string | null;
   };
+  // A title that was superseded is tombstoned as well as closed, so the first
+  // filter already hides it; `heldAt` is what makes an as-of read return the
+  // role somebody held then instead of the one they hold now.
   const flattenLinkDetails = (rows: RawLinkDetail[] | null | undefined) =>
     (rows ?? [])
-      .filter((d) => !d.deleted_at)
+      .filter((d) => heldAt(d, at))
       .map((d) => ({
         name: d.detail_definitions?.name ?? "",
         value:
@@ -529,16 +757,95 @@ export async function expandNode(
     }))
     .filter((l) => l.link_type && l.source_id);
 
+  // ── The values that ended ────────────────────────────────────────────
+  //
+  // A second read, not a widened first one, and it runs only when somebody
+  // asked. It is keyed on `valid_until is not null`, which migration 190's
+  // partial index covers exactly, so it walks the handful of rows that have a
+  // window and never the years of merge tombstones sitting beside them.
+  let history: NodeExpansion["history"];
+  let endedCount = 0;
+  let atInstantDetails = details;
+  if (options.includeHistory || asOfMs !== null) {
+    const { data: endedRows } = await supabase
+      .from("node_details")
+      .select(
+        "value, valid_from, valid_until, created_at, deleted_at, detail_definitions(name), sources(source_type, display_label)",
+      )
+      .eq("user_id", userId)
+      .eq("node_id", nodeId)
+      .not("valid_until", "is", null);
+    const ended = ((endedRows ?? []) as unknown as Array<{
+      value: unknown;
+      valid_from: string | null;
+      valid_until: string | null;
+      created_at: string | null;
+      deleted_at: string | null;
+      detail_definitions: { name: string } | null;
+      sources: { source_type: string; display_label: string } | null;
+    }>).map((d) => ({
+      row: d,
+      name: d.detail_definitions?.name ?? "",
+      value: typeof d.value === "string" ? d.value : JSON.stringify(d.value),
+      source: d.sources
+        ? { label: d.sources.display_label, type: d.sources.source_type }
+        : null,
+    }));
+    endedCount = ended.length;
+
+    // As-of: a value that had ended by `at` is not history, it is what was true
+    // then. It joins `details` rather than the history list, because the whole
+    // point of the option is to hand back the graph as it stood.
+    if (asOfMs !== null) {
+      atInstantDetails = [
+        ...details,
+        ...ended
+          .filter((e) => heldAt(e.row, at))
+          .map((e) => ({
+            name: e.name,
+            value: e.value,
+            source: e.source,
+            confirmed: true,
+          })),
+      ].filter((d) => d.name.length > 0 && d.value.length > 0);
+    }
+
+    if (options.includeHistory) {
+      history = ended
+        .filter((e) => e.name.length > 0 && e.value.length > 0)
+        // Excluded on purpose when reading as of a past instant: a fact that
+        // ended after that date had not ended yet, and listing it as history
+        // would answer "when did she leave" with a date from the caller's own
+        // future.
+        .filter((e) => asOfMs === null || !heldAt(e.row, at))
+        .sort((a, b) => byWindowStart(a.row, b.row))
+        .map((e) => {
+          const w = factWindow(e.row);
+          return {
+            name: e.name,
+            value: e.value,
+            from: w.from,
+            from_known: w.from_known,
+            until: w.until,
+            source: e.source,
+          };
+        });
+    }
+  }
+
   const omittedOutgoing = Math.max(0, outgoing.length - EXPAND_LINK_CAP);
   const omittedIncoming = Math.max(0, incoming.length - EXPAND_LINK_CAP);
   return {
     id: node.id,
     display_name: node.display_name,
     node_type: node.node_types?.name ?? "Node",
-    details,
+    details: atInstantDetails,
     outgoing: outgoing.slice(0, EXPAND_LINK_CAP),
     incoming: incoming.slice(0, EXPAND_LINK_CAP),
     ...(omittedOutgoing > 0 ? { omitted_outgoing: omittedOutgoing } : {}),
     ...(omittedIncoming > 0 ? { omitted_incoming: omittedIncoming } : {}),
+    ...(history ? { history } : {}),
+    ...(endedCount > 0 ? { ended_values: endedCount } : {}),
+    ...(asOfMs !== null ? { as_of: new Date(at).toISOString() } : {}),
   };
 }

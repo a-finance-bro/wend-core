@@ -3,8 +3,19 @@
  *
  * The chat agent's other tools only ever see a node's IMMEDIATE neighbours
  * (expandNode = 1 hop), so it can't answer "how are A and B connected?" when
- * the link is multi-hop (A → me → 1435 Capital → Suhani → Brearley). This does
- * an undirected BFS over the links table and returns the shortest chain.
+ * the link is multi-hop (A → me → 1435 Capital → Suhani → Brearley). This
+ * walks the links table undirected and returns the best chain.
+ *
+ * "Best" is STRENGTH-WEIGHTED, because the question behind most path queries
+ * is "who can actually introduce me". Two chains of equal length are not equal
+ * when one runs through somebody the user talks to weekly and the other
+ * through a LinkedIn import last heard from in 2024. Each edge costs
+ * 1 + 0.9 * (1 - tieStrength(person it reaches)), so a live tie costs about 1
+ * and a dead one about 1.9: warmth re-ranks equal-length chains outright, and
+ * a chain one hop longer can win only when it is much warmer, which is the
+ * honest trade. With no interaction signal anywhere every edge costs the same
+ * and this degrades to exactly the old BFS answer. Deterministic throughout:
+ * the walk breaks ties by cost, then hops, then node id.
  *
  * The graph is small (a personal network — hundreds of nodes, low thousands of
  * links), so loading every node + link once and walking in memory is fine.
@@ -13,6 +24,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { selectAllRows } from "./paginate.js";
+import { computeTieStrength, gatherInteractionSignals } from "./tie-strength.js";
 
 export interface PathStep {
   node_id: string;
@@ -31,6 +43,14 @@ export interface PathResult {
 
 export const ALIAS_LABEL = "likely the same as";
 
+/**
+ * How much a dead tie costs over a live one. Below 1 keeps hop count the
+ * primary signal: at 0.9 the coldest edge costs 1.9, so a chain must be
+ * substantially warmer to justify each extra hop, and equal-length chains are
+ * ranked purely by warmth.
+ */
+const WARMTH_WEIGHT = 0.9;
+
 function norm(s: string): string {
   return s.toLowerCase().replace(/[.,'"]/g, "").replace(/\s+/g, " ").trim();
 }
@@ -44,8 +64,8 @@ function tokenize(s: string): string[] {
  *   - identical after normalization
  *   - one name is a ≥2-token prefix of the other ("1435 Capital" ⊂ "1435
  *     Capital Management")
- *   - a person written long-form vs first-name + initial ("Dana Okafor" /
- *     "Dana O.")
+ *   - a person written long-form vs first-name + initial ("Ansh Vasani" /
+ *     "Ansh V.")
  */
 export function namesLikelySame(a: string, b: string): boolean {
   const na = norm(a);
@@ -60,7 +80,7 @@ export function namesLikelySame(a: string, b: string): boolean {
   if (shorter.length >= 2 && shorter.every((t, i) => longer[i] === t)) {
     return true;
   }
-  // First name + middle/last initial vs full ("dana o" / "dana okafor").
+  // First name + middle/last initial vs full ("ansh v" / "ansh vasani").
   if (ta.length === 2 && tb.length === 2 && ta[0] === tb[0]) {
     const [, a2] = ta;
     const [, b2] = tb;
@@ -153,30 +173,76 @@ export async function findConnectionPath(
     }
   }
 
-  // BFS, recording how we reached each node so we can rebuild the path.
+  // Tie strengths, for the edge weights. Fail-soft: an arm with no
+  // interaction tables gets an empty map, every edge costs the same, and the
+  // walk is the plain shortest path it always was.
+  let strengthById = new Map<string, number>();
+  try {
+    const now = new Date();
+    const signals = await gatherInteractionSignals(supabase, userId);
+    strengthById = new Map(
+      [...signals.entries()].map(([id, sig]) => [id, computeTieStrength(sig, now).score]),
+    );
+  } catch {
+    /* no signal, uniform weights */
+  }
+  const edgeCost = (to: string): number =>
+    1 + WARMTH_WEIGHT * (1 - (strengthById.get(to) ?? 0));
+
+  // Uniform-cost search (Dijkstra), recording how we reached each node so we
+  // can rebuild the path. `maxDepth` still bounds HOPS, so the reach of the
+  // answer is unchanged from the BFS this replaces.
   const prev = new Map<string, { from: string; label: string }>();
-  const visited = new Set<string>([fromId]);
-  let frontier = [fromId];
-  let depth = 0;
+  const cost = new Map<string, number>([[fromId, 0]]);
+  const hopsTo = new Map<string, number>([[fromId, 0]]);
+  const settled = new Set<string>();
   let reached = false;
 
-  while (frontier.length > 0 && depth < maxDepth && !reached) {
-    const next: string[] = [];
-    for (const cur of frontier) {
-      for (const edge of adj.get(cur) ?? []) {
-        if (visited.has(edge.to)) continue;
-        visited.add(edge.to);
-        prev.set(edge.to, { from: cur, label: edge.label });
-        if (edge.to === toId) {
-          reached = true;
-          break;
-        }
-        next.push(edge.to);
+  while (!reached) {
+    // The graph is a personal network; a scan beats a heap at this size and
+    // keeps the tie-break (cost, then hops, then id) explicit and testable.
+    let cur: string | null = null;
+    for (const [id, c] of cost) {
+      if (settled.has(id)) continue;
+      if (cur === null) {
+        cur = id;
+        continue;
       }
-      if (reached) break;
+      const best = cost.get(cur)!;
+      if (
+        c < best ||
+        (c === best &&
+          (hopsTo.get(id)! < hopsTo.get(cur)! ||
+            (hopsTo.get(id)! === hopsTo.get(cur)! && id < cur)))
+      ) {
+        cur = id;
+      }
     }
-    frontier = next;
-    depth++;
+    if (cur === null) break;
+    if (cur === toId) {
+      reached = true;
+      break;
+    }
+    settled.add(cur);
+    const curHops = hopsTo.get(cur)!;
+    if (curHops >= maxDepth) continue;
+    for (const edge of adj.get(cur) ?? []) {
+      if (settled.has(edge.to)) continue;
+      const nextCost = cost.get(cur)! + edgeCost(edge.to);
+      const nextHops = curHops + 1;
+      const oldCost = cost.get(edge.to);
+      // Strictly better only: among equal-cost equal-hop routes the first one
+      // found wins, and the scan order is deterministic, so the answer is too.
+      if (
+        oldCost === undefined ||
+        nextCost < oldCost ||
+        (nextCost === oldCost && nextHops < hopsTo.get(edge.to)!)
+      ) {
+        cost.set(edge.to, nextCost);
+        hopsTo.set(edge.to, nextHops);
+        prev.set(edge.to, { from: cur, label: edge.label });
+      }
+    }
   }
 
   if (!reached) return { found: false, steps: [], hops: 0, usedAlias: false };
