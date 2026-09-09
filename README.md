@@ -171,4 +171,5 @@ this repository. Please do not open public issues for security reports.
 
 AGPL-3.0-only. Wend is a trademark of Wend Labs Inc. The licence grants no
 trademark rights. Contributions are accepted under the
-[Developer Certificate of Origin](CONTRIBUTING.md).
+[Developer Certificate of Origin](CONTRIBUTING.md) and the
+[Contributor License Agreement](CLA.md), agreed once on your first pull request.

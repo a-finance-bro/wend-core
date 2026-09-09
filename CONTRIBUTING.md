@@ -3,11 +3,18 @@
 Thanks for wanting to make relationship memory better. A few ground rules
 keep the project healthy:
 
-## Developer Certificate of Origin (DCO)
+## Developer Certificate of Origin (DCO) and Contributor License Agreement (CLA)
 
 All contributions must be signed off (`git commit -s`), certifying the
 [Developer Certificate of Origin](https://developercertificate.org/): you
 wrote the change or otherwise have the right to submit it under AGPL-3.0.
+
+Contributions also require agreeing to the [Contributor License Agreement](CLA.md)
+once, on your first pull request. The DCO certifies your right to submit the
+change; the CLA grants Wend Labs the license it needs to keep shipping wend-core
+inside its own application, which it can only do as a copyright holder. You keep
+full ownership of your work. Read CLA.md and include the line it asks for in your
+PR description.
 
 ## Principles that PRs must respect
 
@@ -29,5 +36,7 @@ wrote the change or otherwise have the right to submit it under AGPL-3.0.
 
 ## Licensing
 
-The project is AGPL-3.0-only and intends to stay that way. "Wend" is a
-trademark of Wend Labs Inc..
+The project is AGPL-3.0-only and intends to stay that way. Wend Labs Inc. holds
+the copyright and also ships this code inside its proprietary application under
+its own terms, which is why the CLA above exists. "Wend" is a trademark of Wend
+Labs Inc.
